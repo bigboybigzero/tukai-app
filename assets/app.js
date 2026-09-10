@@ -1,15 +1,14 @@
 /* เช็คตู้ไข่ — 2 โหมดเก็บข้อมูล
-   - ไม่มี config Firebase → เก็บในเครื่อง (IndexedDB) ใครเครื่องมัน
-   - มี config Firebase   → ฐานข้อมูลกลาง (Firestore) ทุกคนเห็นชุดเดียวกันแบบทันที
-     รูปเก็บใน Firestore ด้วย (ย่อก่อน) ไม่ใช้ Firebase Storage เพราะต้องผูกบัตรเครดิต */
+   - ไม่มี config Supabase → เก็บในเครื่อง (IndexedDB) ใครเครื่องมัน
+   - มี config Supabase   → ฐานข้อมูลกลาง (Postgres) + รูปใน Supabase Storage ทุกคนเห็นชุดเดียวกันแบบทันที */
 (() => {
   'use strict';
 
   const SEED_FILE = 'นำเข้าข้อมูลตู้ไข่-เริ่มต้น.json';
-  const FIREBASE_VER = '10.14.1';
+  const SUPABASE_SDK = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
 
   let cabinets = [];        // cache ทั้งหมดในหน่วยความจำ
-  let currentPhotos = [];   // รูปในฟอร์ม: File (ใหม่) หรือรูปเดิม (Blob ในโหมดเครื่อง / {pid,thumb} ในโหมดคลาวด์)
+  let currentPhotos = [];   // รูปในฟอร์ม: File (ใหม่) หรือรูปเดิม (Blob ในโหมดเครื่อง / {path,url,thumb} ในโหมดคลาวด์)
   let editingId = null;     // null = โหมดเพิ่มใหม่
   let detailId = null;
   let showAll = false;      // true = โหมด "ดูข้อมูลทั้งหมด"
@@ -153,142 +152,137 @@
     };
   })();
 
-  // ---------- โหมดฐานข้อมูลกลาง (Firebase Firestore อย่างเดียว) ----------
-  // cabinets/{id}  = ข้อมูลตู้ + รูปย่อเล็ก (thumb) สำหรับหน้ารายการ
-  // photos/{pid}   = รูปเต็ม (ย่อไม่เกิน 1280px) โหลดเฉพาะตอนเปิดรายละเอียด จะได้ไม่เปลืองโควตาอ่าน
+  // ---------- โหมดฐานข้อมูลกลาง (Supabase: ตาราง cabinets + bucket photos) ----------
+  // แถวละตู้ photos = [{path,url,thumb,tpath}] รูปเต็ม ≤1280px + รูปย่อ 260px สำหรับหน้ารายการ
   const CloudStore = (() => {
-    let fs = null;
-    const col = () => fs.collection('cabinets');
-    const photosCol = () => fs.collection('photos');
-    const fullCache = new Map(); // pid → dataURL รูปเต็ม
+    const TABLE = 'cabinets';
+    const BUCKET = 'photos';
+    let sb = null;
+    let channel = null;
+
+    const fromRow = (r) => ({
+      id: r.id,
+      name: r.name || '',
+      location: r.location || '',
+      keyNumber: r.key_number || '',
+      note: r.note || '',
+      photos: Array.isArray(r.photos) ? r.photos : [],
+      createdAt: Number(r.created_at) || 0,
+      updatedAt: Number(r.updated_at) || 0,
+    });
+    const toRow = (c, photos) => ({
+      id: c.id,
+      name: c.name || '',
+      location: c.location || '',
+      key_number: c.keyNumber || '',
+      note: c.note || '',
+      photos,
+      created_at: c.createdAt || Date.now(),
+      updated_at: c.updatedAt || Date.now(),
+    });
+
+    async function upload(path, blob) {
+      const { error } = await sb.storage.from(BUCKET).upload(path, blob, { contentType: 'image/jpeg', upsert: true });
+      if (error) throw new Error('อัปโหลดรูปไม่สำเร็จ: ' + error.message);
+      return sb.storage.from(BUCKET).getPublicUrl(path).data.publicUrl;
+    }
 
     async function makePhoto(cabinetId, source) {
       const blob = typeof source === 'string' ? dataURLToBlob(source) : source;
-      let fullData = await blobToDataURL(await compressImage(blob, 1280, 0.8));
-      // Firestore จำกัด 1MB ต่อเอกสาร ถ้ายังใหญ่ให้ย่อลงอีกขั้น
-      if (fullData.length > 900000) fullData = await blobToDataURL(await compressImage(blob, 1024, 0.7));
-      if (fullData.length > 900000) fullData = await blobToDataURL(await compressImage(blob, 800, 0.6));
-      const thumb = await blobToDataURL(await compressImage(blob, 260, 0.7));
+      const full = await compressImage(blob, 1280, 0.82);
+      const thumb = await compressImage(blob, 260, 0.7);
       const pid = uid();
-      await photosCol().doc(pid).set({ cabinetId, data: fullData, createdAt: Date.now() });
-      fullCache.set(pid, fullData);
-      return { pid, thumb };
+      const path = `cabinets/${cabinetId}/${pid}.jpg`;
+      const tpath = `cabinets/${cabinetId}/${pid}_t.jpg`;
+      const url = await upload(path, full);
+      const thumbUrl = await upload(tpath, thumb);
+      return { path, url, thumb: thumbUrl, tpath };
     }
 
     async function deletePhotos(photos) {
+      const paths = [];
       for (const p of photos || []) {
-        if (p && p.pid) {
-          try { await photosCol().doc(p.pid).delete(); } catch (_) { /* อาจถูกลบไปแล้ว */ }
-          fullCache.delete(p.pid);
-        }
+        if (p && p.path) paths.push(p.path);
+        if (p && p.tpath) paths.push(p.tpath);
       }
+      if (paths.length) { try { await sb.storage.from(BUCKET).remove(paths); } catch (_) { /* ไฟล์อาจถูกลบไปแล้ว */ } }
     }
 
-    async function loadFull(p) {
-      if (!p || !p.pid) return photoSrc(p);
-      if (!fullCache.has(p.pid)) {
-        try {
-          const d = await photosCol().doc(p.pid).get();
-          if (d.exists) fullCache.set(p.pid, d.data().data);
-        } catch (_) { /* ออฟไลน์ → ใช้รูปย่อไปก่อน */ }
-      }
-      return fullCache.get(p.pid) || p.thumb || '';
-    }
+    const keepPhoto = (p) => ({ path: p.path || '', url: p.url, thumb: p.thumb || p.url, tpath: p.tpath || '' });
 
-    function toDoc(data, photos) {
-      return {
-        name: data.name || '',
-        location: data.location || '',
-        keyNumber: data.keyNumber || '',
-        note: data.note || '',
-        photos,
-        createdAt: data.createdAt || Date.now(),
-        updatedAt: data.updatedAt || Date.now(),
-      };
-    }
-
-    async function batchDelete(docs) {
-      for (let i = 0; i < docs.length; i += 400) {
-        const b = fs.batch();
-        docs.slice(i, i + 400).forEach((d) => b.delete(d.ref));
-        await b.commit();
-      }
+    async function fetchAll() {
+      const { data, error } = await sb.from(TABLE).select('*');
+      if (error) throw new Error(error.message);
+      cabinets = (data || []).map(fromRow);
     }
 
     return {
       label: '☁ ฐานข้อมูลกลาง',
       async init(cfg) {
-        const base = `https://www.gstatic.com/firebasejs/${FIREBASE_VER}/`;
-        await loadScript(base + 'firebase-app-compat.js');
-        await loadScript(base + 'firebase-firestore-compat.js');
-        firebase.initializeApp(cfg);
-        fs = firebase.firestore();
-        try { await fs.enablePersistence({ synchronizeTabs: true }); } catch (_) { /* บางเบราว์เซอร์ไม่รองรับ ก็ใช้ออนไลน์อย่างเดียว */ }
+        await loadScript(SUPABASE_SDK);
+        sb = window.supabase.createClient(cfg.url, cfg.anonKey);
       },
-      // ฟังการเปลี่ยนแปลงแบบทันที: ใครแก้จากเครื่องไหน ทุกเครื่องเห็นตาม
-      subscribe(onChange) {
-        return new Promise((resolve) => {
-          col().onSnapshot((snap) => {
-            cabinets = snap.docs.map((d) => {
-              const c = { id: d.id, ...d.data() };
-              if (!Array.isArray(c.photos)) c.photos = [];
-              return c;
-            });
-            onChange();
-            resolve();
-          }, (err) => {
-            console.error(err);
-            showToast('เชื่อมต่อฐานข้อมูลกลางไม่ได้: ' + (err.message || err));
-            resolve();
-          });
-        });
+      // โหลดครั้งแรก แล้วฟังการเปลี่ยนแปลงแบบทันที: ใครแก้จากเครื่องไหน ทุกเครื่องเห็นตาม
+      async subscribe(onChange) {
+        try { await fetchAll(); }
+        catch (err) { console.error(err); showToast('เชื่อมต่อฐานข้อมูลกลางไม่ได้: ' + (err.message || err)); }
+        onChange();
+        channel = sb.channel('cabinets-live')
+          .on('postgres_changes', { event: '*', schema: 'public', table: TABLE }, async () => {
+            try { await fetchAll(); onChange(); } catch (err) { console.error(err); }
+          })
+          .subscribe();
       },
       async save(data, { kept, newFiles, oldPhotos }) {
         const id = data.id;
-        const photos = kept.filter((p) => p && p.pid).map((p) => ({ pid: p.pid, thumb: p.thumb || '' }));
+        const photos = kept.filter((p) => p && p.url).map(keepPhoto);
         for (const f of newFiles) photos.push(await makePhoto(id, f));
-        const removed = (oldPhotos || []).filter((p) => p && p.pid && !photos.some((k) => k.pid === p.pid));
+        const removed = (oldPhotos || []).filter((p) => p && p.path && !photos.some((k) => k.path === p.path));
         await deletePhotos(removed);
-        const doc = toDoc(data, photos);
-        await col().doc(id).set(doc);
-        return { id, ...doc };
+        const row = toRow(data, photos);
+        const { error } = await sb.from(TABLE).upsert(row);
+        if (error) throw new Error(error.message);
+        return fromRow(row);
       },
       async remove(id) {
         const c = cabinets.find((x) => x.id === id);
         await deletePhotos(c ? c.photos : []);
-        await col().doc(id).delete();
+        const { error } = await sb.from(TABLE).delete().eq('id', id);
+        if (error) throw new Error(error.message);
       },
       async clear() {
-        await batchDelete((await photosCol().get()).docs);
-        await batchDelete((await col().get()).docs);
-        fullCache.clear();
+        const { data } = await sb.from(TABLE).select('id,photos');
+        for (const r of data || []) await deletePhotos(r.photos);
+        const { error } = await sb.from(TABLE).delete().neq('id', '');
+        if (error) throw new Error(error.message);
       },
       async bulkPut(list) {
-        const prepared = [];
+        const rows = [];
         for (const raw of list) {
           const id = raw.id || uid();
           const photos = [];
           for (const p of raw.photos || []) {
             if (typeof p === 'string') photos.push(await makePhoto(id, p));
             else if (p && p.data) photos.push(await makePhoto(id, p.data));
-            else if (p && p.pid) photos.push({ pid: p.pid, thumb: p.thumb || '' });
+            else if (p && p.url) photos.push(keepPhoto(p));
           }
-          prepared.push({ id, ...toDoc(raw, photos) });
+          rows.push(toRow({ ...raw, id }, photos));
         }
-        for (let i = 0; i < prepared.length; i += 400) {
-          const b = fs.batch();
-          prepared.slice(i, i + 400).forEach((c) => { const { id, ...doc } = c; b.set(col().doc(id), doc); });
-          await b.commit();
+        for (let i = 0; i < rows.length; i += 200) {
+          const { error } = await sb.from(TABLE).upsert(rows.slice(i, i + 200));
+          if (error) throw new Error(error.message);
         }
-        return prepared;
+        return rows.map(fromRow);
       },
-      async loadFullPhotos(cab) {
-        const out = [];
-        for (const p of cab.photos || []) out.push(await loadFull(p));
-        return out;
+      async loadFullPhotos(cab) { return (cab.photos || []).map((p) => (p && p.url) || photoSrc(p)); },
+      // backup ฝังรูปจริงเป็น dataURL → ไฟล์เดียวใช้กู้คืนได้ทั้งสองโหมด
+      async exportPhoto(p) {
+        if (p && p.url) {
+          try { return await blobToDataURL(await (await fetch(p.url)).blob()); }
+          catch (_) { return p; }
+        }
+        return p;
       },
-      // backup ฝังรูปเต็มเป็น dataURL เหมือนโหมดเครื่อง → ไฟล์เดียวใช้กู้คืนได้ทั้งสองโหมด
-      async exportPhoto(p) { return loadFull(p); },
     };
   })();
 
@@ -414,7 +408,7 @@
     $('#btnDelete').onclick = () => confirmDelete(c.id);
     views('viewDetail');
 
-    // โหมดคลาวด์: แสดงรูปย่อก่อน แล้วค่อยสลับเป็นรูปเต็มเมื่อโหลดเสร็จ (ถ้ายังอยู่หน้าเดิม)
+    // โหมดคลาวด์: แสดงรูปย่อก่อน แล้วสลับเป็นรูปเต็ม (ถ้ายังอยู่หน้าเดิม)
     if (cloudMode && c.photos && c.photos.length) {
       store.loadFullPhotos(c).then((list) => {
         if (detailId !== id) return;
@@ -597,7 +591,7 @@
       showToast('กำลังกู้คืนข้อมูล...');
       await store.clear();
       const added = await store.bulkPut(payload.cabinets);
-      if (!cloudMode) cabinets = added; // โหมดคลาวด์ snapshot จะอัปเดตให้เอง
+      cabinets = added;
       renderList();
       showToast('กู้คืนข้อมูลสำเร็จ');
     } catch (err) {
@@ -622,7 +616,7 @@
     try {
       if (cabinets.length === 0) {
         const added = await store.bulkPut(payload.cabinets);
-        if (!cloudMode) cabinets = added;
+        cabinets = added;
         showToast(`โหลดข้อมูลเริ่มต้น ${added.length} ตู้แล้ว`);
         return;
       }
@@ -651,8 +645,8 @@
 
   // ---------- init ----------
   (async function init() {
-    const cfg = window.TUKAI_FIREBASE;
-    if (cfg && cfg.projectId) {
+    const cfg = window.TUKAI_SUPABASE;
+    if (cfg && cfg.url && cfg.anonKey) {
       try {
         await CloudStore.init(cfg);
         store = CloudStore;

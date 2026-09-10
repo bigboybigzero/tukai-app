@@ -17,9 +17,9 @@
 - ไม่เชื่อมระบบสต๊อกหรือระบบขายใด ๆ
 
 ## กฎข้อมูล
-- 2 โหมดเก็บข้อมูล เลือกอัตโนมัติจาก `assets/firebase-config.js`: ไม่มี config → IndexedDB ในเครื่อง (ใครเครื่องมัน), มี config → Firebase Firestore เป็นฐานข้อมูลกลาง (real-time ทุกเครื่อง)
-- โหมดคลาวด์ใช้ Firestore อย่างเดียว ไม่ใช้ Firebase Storage (Storage รุ่นใหม่บังคับผูกบัตรเครดิต) รูปย่อไม่เกิน 1280px เก็บเป็น dataURL ใน collection `photos/{pid}` แยกจาก `cabinets/{id}` ที่เก็บแค่ thumb 260px เพื่อไม่เปลืองโควตาอ่านตอนโหลดรายการ (จำกัด 1MB/เอกสาร)
-- Firestore rules เปิด read/write ทุกคน (ลิงก์ = สิทธิ์ใช้งาน) ตามที่เจ้าของต้องการส่งลิงก์ให้เพื่อนโดยไม่ต้อง login → ต้องมีปุ่ม export/import ไว้สำรองเสมอ
+- 2 โหมดเก็บข้อมูล เลือกอัตโนมัติจาก `assets/supabase-config.js`: ไม่มี config → IndexedDB ในเครื่อง (ใครเครื่องมัน), มี config → Supabase เป็นฐานข้อมูลกลาง (real-time ทุกเครื่อง)
+- Supabase: โปรเจกต์ `tukai` (ref `pgqyhgcqygpcaacsfuhs`) ใน org "SRC garage" ของบัญชีเจ้าของ (เลือกแทน Firebase ตามที่เจ้าของสั่ง 2026-09-10) ตาราง `public.cabinets` (id text pk, name, location, key_number, note, photos jsonb, created_at/updated_at bigint) + bucket `photos` (public) รูปเต็ม ≤1280px `cabinets/{id}/{pid}.jpg` และรูปย่อ 260px `{pid}_t.jpg` — SQL ตั้งค่าอยู่ใน `supabase-setup.sql`
+- RLS/Storage policies เปิด read/write ให้ anon ทุกคน (ลิงก์ = สิทธิ์ใช้งาน) ตามที่เจ้าของต้องการส่งลิงก์ให้เพื่อนโดยไม่ต้อง login → ต้องมีปุ่ม export/import ไว้สำรองเสมอ ใช้ publishable key (เปิดเผยได้) ห้ามใส่ secret key ในโค้ดเด็ดขาด
 - เผยแพร่ผ่าน GitHub Pages: repo `bigboybigzero/tukai-app` (push ผ่าน SSH ได้จากเครื่องนี้) ลิงก์ https://bigboybigzero.github.io/tukai-app/ — ขั้นตอนที่เจ้าของต้องกดเองอยู่ใน `วิธีเอาขึ้นออนไลน์.md`
 - ฟิลด์ชื่อตู้/สถานที่/เลขกุญแจ เป็นข้อความอิสระ ไม่บังคับรูปแบบ
 - รูปภาพเก็บเป็นไฟล์ในเครื่อง ไม่อัปโหลดขึ้นที่ไหน
