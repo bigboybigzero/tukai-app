@@ -5,13 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>เช็คตู้ไข่</title>
 <link rel="stylesheet" href="assets/skin.css">
-<link rel="stylesheet" href="assets/app.css?v=6">
+<link rel="stylesheet" href="assets/app.css?v=7">
 </head>
 <body>
 
 <div class="top">
   <img class="logo" src="assets/logo.jpg?v=4" alt="เจมตะลุยโลก">
   <b class="disp">เช็คตู้ไข่</b>
+  <span class="chip" id="modeChip" hidden></span>
   <div class="sp"></div>
   <button class="icon-btn" id="btnBackup" title="สำรอง/กู้คืนข้อมูล">⋮</button>
 </div>
@@ -77,6 +78,7 @@
 <input type="file" id="importFile" accept="application/json" class="hidden">
 <div class="toast" id="toast"></div>
 
-<script src="assets/app.js?v=3"></script>
+<script src="assets/firebase-config.js?v=7"></script>
+<script src="assets/app.js?v=7"></script>
 </body>
 </html>

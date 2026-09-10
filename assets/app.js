@@ -1,59 +1,20 @@
-/* เช็คตู้ไข่ — เก็บข้อมูลใน IndexedDB เครื่องเดียว ไม่มี server */
+/* เช็คตู้ไข่ — 2 โหมดเก็บข้อมูล
+   - ไม่มี config Firebase → เก็บในเครื่อง (IndexedDB) ใครเครื่องมัน
+   - มี config Firebase   → ฐานข้อมูลกลาง (Firestore) ทุกคนเห็นชุดเดียวกันแบบทันที
+     รูปเก็บใน Firestore ด้วย (ย่อก่อน) ไม่ใช้ Firebase Storage เพราะต้องผูกบัตรเครดิต */
 (() => {
   'use strict';
 
-  const DB_NAME = 'tukai-db';
-  const DB_VERSION = 1;
-  const STORE = 'cabinets';
-  let db = null;
+  const SEED_FILE = 'นำเข้าข้อมูลตู้ไข่-เริ่มต้น.json';
+  const FIREBASE_VER = '10.14.1';
+
   let cabinets = [];        // cache ทั้งหมดในหน่วยความจำ
-  let currentPhotos = [];   // Blob[] ของฟอร์มที่กำลังแก้ไข/เพิ่ม
+  let currentPhotos = [];   // รูปในฟอร์ม: File (ใหม่) หรือรูปเดิม (Blob ในโหมดเครื่อง / {pid,thumb} ในโหมดคลาวด์)
   let editingId = null;     // null = โหมดเพิ่มใหม่
   let detailId = null;
   let showAll = false;      // true = โหมด "ดูข้อมูลทั้งหมด"
-
-  // ---------- IndexedDB ----------
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
-        const d = req.result;
-        if (!d.objectStoreNames.contains(STORE)) {
-          d.createObjectStore(STORE, { keyPath: 'id' });
-        }
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  function txStore(mode) {
-    return db.transaction(STORE, mode).objectStore(STORE);
-  }
-
-  function getAll() {
-    return new Promise((resolve, reject) => {
-      const req = txStore('readonly').getAll();
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  function putCabinet(cab) {
-    return new Promise((resolve, reject) => {
-      const req = txStore('readwrite').put(cab);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  function deleteCabinet(id) {
-    return new Promise((resolve, reject) => {
-      const req = txStore('readwrite').delete(id);
-      req.onsuccess = () => resolve();
-      req.onerror = () => reject(req.error);
-    });
-  }
+  let store = null;
+  let cloudMode = false;
 
   // ---------- helpers ----------
   const $ = (sel) => document.querySelector(sel);
@@ -64,7 +25,7 @@
     t.textContent = msg;
     t.classList.add('show');
     clearTimeout(showToast._h);
-    showToast._h = setTimeout(() => t.classList.remove('show'), 1800);
+    showToast._h = setTimeout(() => t.classList.remove('show'), 2200);
   }
 
   function blobToDataURL(blob) {
@@ -85,6 +46,29 @@
     return new Blob([arr], { type: mime });
   }
 
+  // รูปจากมือถือใหญ่หลาย MB → ย่อก่อนเก็บ ทั้งประหยัดที่และอัปโหลดเร็ว
+  async function compressImage(file, maxSide = 1280, quality = 0.82) {
+    if (!file || !String(file.type || '').startsWith('image/')) return file;
+    let bmp = null;
+    try { bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }); }
+    catch (_) { try { bmp = await createImageBitmap(file); } catch (__) { return file; } }
+    const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(bmp.width * scale));
+    canvas.height = Math.max(1, Math.round(bmp.height * scale));
+    canvas.getContext('2d').drawImage(bmp, 0, 0, canvas.width, canvas.height);
+    return new Promise((resolve) => canvas.toBlob((b) => resolve(b || file), 'image/jpeg', quality));
+  }
+
+  function photoSrc(p) {
+    if (p instanceof Blob) return URL.createObjectURL(p);
+    if (typeof p === 'string') return p;
+    if (p && p.data) return p.data;
+    if (p && p.thumb) return p.thumb;
+    if (p && p.url) return p.url;
+    return '';
+  }
+
   function views(name) {
     ['viewList', 'viewDetail', 'viewForm'].forEach((v) => {
       $('#' + v).classList.toggle('hidden', v !== name);
@@ -92,11 +76,223 @@
     window.scrollTo(0, 0);
   }
 
-  // ---------- รายการ + ค้นหา ----------
+  function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+  }
+
   function normalize(s) {
     return (s || '').toLowerCase().trim();
   }
 
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('โหลดไม่ได้: ' + src));
+      document.head.appendChild(s);
+    });
+  }
+
+  // ---------- โหมดเก็บในเครื่อง (IndexedDB) ----------
+  const LocalStore = (() => {
+    const DB_NAME = 'tukai-db';
+    const STORE = 'cabinets';
+    let db = null;
+
+    const req = (r) => new Promise((resolve, reject) => {
+      r.onsuccess = () => resolve(r.result);
+      r.onerror = () => reject(r.error);
+    });
+    const tx = (mode) => db.transaction(STORE, mode).objectStore(STORE);
+
+    return {
+      label: 'เครื่องนี้',
+      async init() {
+        db = await new Promise((resolve, reject) => {
+          const r = indexedDB.open(DB_NAME, 1);
+          r.onupgradeneeded = () => {
+            if (!r.result.objectStoreNames.contains(STORE)) r.result.createObjectStore(STORE, { keyPath: 'id' });
+          };
+          r.onsuccess = () => resolve(r.result);
+          r.onerror = () => reject(r.error);
+        });
+      },
+      all() { return req(tx('readonly').getAll()); },
+      async save(data, { kept, newFiles }) {
+        const photos = kept.filter((p) => p instanceof Blob);
+        for (const f of newFiles) photos.push(await compressImage(f));
+        const cab = { ...data, photos };
+        await req(tx('readwrite').put(cab));
+        return cab;
+      },
+      remove(id) { return req(tx('readwrite').delete(id)); },
+      clear() { return req(tx('readwrite').clear()); },
+      // ใส่ทั้งชุดใน transaction เดียว: เร็ว และถ้าพังกลางทางจะไม่ได้ข้อมูลครึ่งเดียว
+      bulkPut(list) {
+        return new Promise((resolve, reject) => {
+          const t = db.transaction(STORE, 'readwrite');
+          const s = t.objectStore(STORE);
+          const added = [];
+          for (const raw of list) {
+            const photos = (raw.photos || [])
+              .map((d) => (typeof d === 'string' ? dataURLToBlob(d) : (d && d.data ? dataURLToBlob(d.data) : d)))
+              .filter((p) => p instanceof Blob);
+            const cab = { ...raw, photos };
+            s.put(cab);
+            added.push(cab);
+          }
+          t.oncomplete = () => resolve(added);
+          t.onerror = () => reject(t.error);
+        });
+      },
+      async loadFullPhotos(cab) { return (cab.photos || []).map(photoSrc); },
+      async exportPhoto(p) { return p instanceof Blob ? blobToDataURL(p) : p; },
+    };
+  })();
+
+  // ---------- โหมดฐานข้อมูลกลาง (Firebase Firestore อย่างเดียว) ----------
+  // cabinets/{id}  = ข้อมูลตู้ + รูปย่อเล็ก (thumb) สำหรับหน้ารายการ
+  // photos/{pid}   = รูปเต็ม (ย่อไม่เกิน 1280px) โหลดเฉพาะตอนเปิดรายละเอียด จะได้ไม่เปลืองโควตาอ่าน
+  const CloudStore = (() => {
+    let fs = null;
+    const col = () => fs.collection('cabinets');
+    const photosCol = () => fs.collection('photos');
+    const fullCache = new Map(); // pid → dataURL รูปเต็ม
+
+    async function makePhoto(cabinetId, source) {
+      const blob = typeof source === 'string' ? dataURLToBlob(source) : source;
+      let fullData = await blobToDataURL(await compressImage(blob, 1280, 0.8));
+      // Firestore จำกัด 1MB ต่อเอกสาร ถ้ายังใหญ่ให้ย่อลงอีกขั้น
+      if (fullData.length > 900000) fullData = await blobToDataURL(await compressImage(blob, 1024, 0.7));
+      if (fullData.length > 900000) fullData = await blobToDataURL(await compressImage(blob, 800, 0.6));
+      const thumb = await blobToDataURL(await compressImage(blob, 260, 0.7));
+      const pid = uid();
+      await photosCol().doc(pid).set({ cabinetId, data: fullData, createdAt: Date.now() });
+      fullCache.set(pid, fullData);
+      return { pid, thumb };
+    }
+
+    async function deletePhotos(photos) {
+      for (const p of photos || []) {
+        if (p && p.pid) {
+          try { await photosCol().doc(p.pid).delete(); } catch (_) { /* อาจถูกลบไปแล้ว */ }
+          fullCache.delete(p.pid);
+        }
+      }
+    }
+
+    async function loadFull(p) {
+      if (!p || !p.pid) return photoSrc(p);
+      if (!fullCache.has(p.pid)) {
+        try {
+          const d = await photosCol().doc(p.pid).get();
+          if (d.exists) fullCache.set(p.pid, d.data().data);
+        } catch (_) { /* ออฟไลน์ → ใช้รูปย่อไปก่อน */ }
+      }
+      return fullCache.get(p.pid) || p.thumb || '';
+    }
+
+    function toDoc(data, photos) {
+      return {
+        name: data.name || '',
+        location: data.location || '',
+        keyNumber: data.keyNumber || '',
+        note: data.note || '',
+        photos,
+        createdAt: data.createdAt || Date.now(),
+        updatedAt: data.updatedAt || Date.now(),
+      };
+    }
+
+    async function batchDelete(docs) {
+      for (let i = 0; i < docs.length; i += 400) {
+        const b = fs.batch();
+        docs.slice(i, i + 400).forEach((d) => b.delete(d.ref));
+        await b.commit();
+      }
+    }
+
+    return {
+      label: '☁ ฐานข้อมูลกลาง',
+      async init(cfg) {
+        const base = `https://www.gstatic.com/firebasejs/${FIREBASE_VER}/`;
+        await loadScript(base + 'firebase-app-compat.js');
+        await loadScript(base + 'firebase-firestore-compat.js');
+        firebase.initializeApp(cfg);
+        fs = firebase.firestore();
+        try { await fs.enablePersistence({ synchronizeTabs: true }); } catch (_) { /* บางเบราว์เซอร์ไม่รองรับ ก็ใช้ออนไลน์อย่างเดียว */ }
+      },
+      // ฟังการเปลี่ยนแปลงแบบทันที: ใครแก้จากเครื่องไหน ทุกเครื่องเห็นตาม
+      subscribe(onChange) {
+        return new Promise((resolve) => {
+          col().onSnapshot((snap) => {
+            cabinets = snap.docs.map((d) => {
+              const c = { id: d.id, ...d.data() };
+              if (!Array.isArray(c.photos)) c.photos = [];
+              return c;
+            });
+            onChange();
+            resolve();
+          }, (err) => {
+            console.error(err);
+            showToast('เชื่อมต่อฐานข้อมูลกลางไม่ได้: ' + (err.message || err));
+            resolve();
+          });
+        });
+      },
+      async save(data, { kept, newFiles, oldPhotos }) {
+        const id = data.id;
+        const photos = kept.filter((p) => p && p.pid).map((p) => ({ pid: p.pid, thumb: p.thumb || '' }));
+        for (const f of newFiles) photos.push(await makePhoto(id, f));
+        const removed = (oldPhotos || []).filter((p) => p && p.pid && !photos.some((k) => k.pid === p.pid));
+        await deletePhotos(removed);
+        const doc = toDoc(data, photos);
+        await col().doc(id).set(doc);
+        return { id, ...doc };
+      },
+      async remove(id) {
+        const c = cabinets.find((x) => x.id === id);
+        await deletePhotos(c ? c.photos : []);
+        await col().doc(id).delete();
+      },
+      async clear() {
+        await batchDelete((await photosCol().get()).docs);
+        await batchDelete((await col().get()).docs);
+        fullCache.clear();
+      },
+      async bulkPut(list) {
+        const prepared = [];
+        for (const raw of list) {
+          const id = raw.id || uid();
+          const photos = [];
+          for (const p of raw.photos || []) {
+            if (typeof p === 'string') photos.push(await makePhoto(id, p));
+            else if (p && p.data) photos.push(await makePhoto(id, p.data));
+            else if (p && p.pid) photos.push({ pid: p.pid, thumb: p.thumb || '' });
+          }
+          prepared.push({ id, ...toDoc(raw, photos) });
+        }
+        for (let i = 0; i < prepared.length; i += 400) {
+          const b = fs.batch();
+          prepared.slice(i, i + 400).forEach((c) => { const { id, ...doc } = c; b.set(col().doc(id), doc); });
+          await b.commit();
+        }
+        return prepared;
+      },
+      async loadFullPhotos(cab) {
+        const out = [];
+        for (const p of cab.photos || []) out.push(await loadFull(p));
+        return out;
+      },
+      // backup ฝังรูปเต็มเป็น dataURL เหมือนโหมดเครื่อง → ไฟล์เดียวใช้กู้คืนได้ทั้งสองโหมด
+      async exportPhoto(p) { return loadFull(p); },
+    };
+  })();
+
+  // ---------- รายการ + ค้นหา ----------
   function renderList() {
     const q = normalize($('#searchInput').value);
     const list = $('#list');
@@ -152,17 +348,15 @@
       btn.type = 'button';
       btn.onclick = () => openDetail(c.id);
 
-      const thumbWrap = document.createElement('div');
-      thumbWrap.className = 'item-thumb';
       if (c.photos && c.photos.length) {
         const img = document.createElement('img');
         img.className = 'item-thumb';
-        img.style.width = '60px';
-        img.style.height = '60px';
-        img.src = URL.createObjectURL(c.photos[0]);
-        img.onload = () => URL.revokeObjectURL(img.src);
+        img.loading = 'lazy';
+        img.src = photoSrc(c.photos[0]);
         btn.appendChild(img);
       } else {
+        const thumbWrap = document.createElement('div');
+        thumbWrap.className = 'item-thumb';
         thumbWrap.textContent = '📦';
         btn.appendChild(thumbWrap);
       }
@@ -184,20 +378,20 @@
     }
   }
 
-  function escapeHtml(s) {
-    return String(s || '').replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
-    }[c]));
-  }
-
   // ---------- หน้ารายละเอียด ----------
   function openDetail(id) {
     detailId = id;
     const c = cabinets.find((x) => x.id === id);
-    if (!c) return;
+    if (!c) {
+      // ถูกลบไปแล้ว (เช่น เพื่อนลบจากอีกเครื่อง) → กลับหน้ารายการ
+      detailId = null;
+      views('viewList');
+      renderList();
+      return;
+    }
 
     const gallery = (c.photos && c.photos.length)
-      ? `<div class="detail-gallery">${c.photos.map((b) => `<img src="${URL.createObjectURL(b)}">`).join('')}</div>`
+      ? `<div class="detail-gallery">${c.photos.map((p, i) => `<img data-idx="${i}" src="${photoSrc(p)}">`).join('')}</div>`
       : `<div class="detail-gallery"><div class="noimg">ไม่มีรูปภาพ</div></div>`;
 
     $('#detailBody').innerHTML = `
@@ -219,16 +413,34 @@
     $('#btnEdit').onclick = () => openForm(c.id);
     $('#btnDelete').onclick = () => confirmDelete(c.id);
     views('viewDetail');
+
+    // โหมดคลาวด์: แสดงรูปย่อก่อน แล้วค่อยสลับเป็นรูปเต็มเมื่อโหลดเสร็จ (ถ้ายังอยู่หน้าเดิม)
+    if (cloudMode && c.photos && c.photos.length) {
+      store.loadFullPhotos(c).then((list) => {
+        if (detailId !== id) return;
+        list.forEach((src, i) => {
+          const img = $(`#detailBody img[data-idx="${i}"]`);
+          if (img && src) img.src = src;
+        });
+      });
+    }
   }
 
   async function confirmDelete(id) {
     const c = cabinets.find((x) => x.id === id);
-    if (!confirm(`ลบตู้ "${c ? c.name : ''}" ใช่หรือไม่? การลบไม่สามารถกู้คืนได้`)) return;
-    await deleteCabinet(id);
-    cabinets = cabinets.filter((x) => x.id !== id);
-    showToast('ลบตู้แล้ว');
-    views('viewList');
-    renderList();
+    const label = c ? (c.location || c.name) : '';
+    if (!confirm(`ลบตู้ "${label}" ใช่หรือไม่? การลบไม่สามารถกู้คืนได้`)) return;
+    try {
+      await store.remove(id);
+      cabinets = cabinets.filter((x) => x.id !== id);
+      showToast('ลบตู้แล้ว');
+      detailId = null;
+      views('viewList');
+      renderList();
+    } catch (err) {
+      console.error(err);
+      showToast('ลบไม่สำเร็จ: ' + (err.message || err));
+    }
   }
 
   // ---------- ฟอร์มเพิ่ม/แก้ไข ----------
@@ -257,12 +469,11 @@
   function renderPhotoPreview() {
     const grid = $('#photoPreview');
     grid.innerHTML = '';
-    currentPhotos.forEach((blob, idx) => {
+    currentPhotos.forEach((p, idx) => {
       const cell = document.createElement('div');
       cell.className = 'photo-cell';
       const img = document.createElement('img');
-      img.src = URL.createObjectURL(blob);
-      img.onload = () => URL.revokeObjectURL(img.src);
+      img.src = photoSrc(p);
       const rm = document.createElement('button');
       rm.className = 'rm';
       rm.type = 'button';
@@ -290,30 +501,36 @@
     const locationVal = $('#fLocation').value.trim();
     if (!name && !locationVal) { showToast('กรุณากรอกสถานที่ หรือชื่อตู้อย่างน้อย 1 อย่าง'); return; }
 
-    const now = Date.now();
-    let cab;
-    if (editingId) {
-      cab = cabinets.find((x) => x.id === editingId);
-    } else {
-      cab = { id: uid(), createdAt: now };
-      cabinets.push(cab);
-    }
-    cab.name = name;
-    cab.location = locationVal;
-    cab.keyNumber = $('#fKey').value.trim();
-    cab.note = $('#fNote').value.trim();
-    cab.photos = [...currentPhotos];
-    cab.updatedAt = now;
+    const submitBtn = e.target.querySelector('button[type="submit"]');
+    if (submitBtn.disabled) return; // กันกดซ้ำระหว่างกำลังบันทึก
+    submitBtn.disabled = true;
+    submitBtn.textContent = cloudMode ? 'กำลังบันทึกขึ้นฐานข้อมูลกลาง...' : 'กำลังบันทึก...';
 
-    await putCabinet(cab);
-    showToast('บันทึกแล้ว');
-    renderList();
-    if (editingId) {
-      openDetail(editingId);
-    } else {
-      views('viewList');
+    try {
+      const now = Date.now();
+      let cab = editingId ? cabinets.find((x) => x.id === editingId) : null;
+      const isNew = !cab;
+      if (isNew) cab = { id: editingId || uid(), createdAt: now, photos: [] };
+
+      const kept = currentPhotos.filter((p) => !(p instanceof File));
+      const newFiles = currentPhotos.filter((p) => p instanceof File);
+      const data = { ...cab, name, location: locationVal, keyNumber: $('#fKey').value.trim(), note: $('#fNote').value.trim(), updatedAt: now };
+
+      const saved = await store.save(data, { kept, newFiles, oldPhotos: cab.photos || [] });
+      if (isNew) cabinets.push(saved); else Object.assign(cab, saved);
+
+      showToast('บันทึกแล้ว');
+      renderList();
+      const savedId = saved.id;
+      editingId = null;
+      if (isNew) views('viewList'); else openDetail(savedId);
+    } catch (err) {
+      console.error(err);
+      showToast('บันทึกไม่สำเร็จ: ' + (err.message || err));
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'บันทึก';
     }
-    editingId = null;
   });
 
   // ---------- นำทาง ----------
@@ -325,7 +542,7 @@
   $('#btnBackFromForm').onclick = () => {
     if (editingId) { openDetail(editingId); } else { views('viewList'); renderList(); }
   };
-  $('#btnBackFromDetail').onclick = () => { views('viewList'); renderList(); };
+  $('#btnBackFromDetail').onclick = () => { detailId = null; views('viewList'); renderList(); };
   $('#searchInput').addEventListener('input', renderList);
 
   // ---------- สำรอง / กู้คืนข้อมูล ----------
@@ -336,6 +553,7 @@
     const pop = document.createElement('div');
     pop.className = 'menu-pop';
     pop.innerHTML = `
+      <div class="muted small" style="padding:6px 12px 4px">${cloudMode ? 'ข้อมูลอยู่บนฐานข้อมูลกลาง ทุกคนเห็นชุดเดียวกัน' : 'ข้อมูลอยู่ในเครื่องนี้เท่านั้น'}</div>
       <button id="mExport">สำรองข้อมูล (Export)</button>
       <button id="mImport">กู้คืนข้อมูล (Import)</button>
     `;
@@ -351,12 +569,11 @@
   };
 
   async function exportData() {
-    const payload = { version: 1, exportedAt: new Date().toISOString(), cabinets: [] };
+    showToast('กำลังเตรียมไฟล์สำรอง...');
+    const payload = { version: 2, mode: cloudMode ? 'cloud' : 'local', exportedAt: new Date().toISOString(), cabinets: [] };
     for (const c of cabinets) {
       const photos = [];
-      for (const blob of (c.photos || [])) {
-        photos.push(await blobToDataURL(blob));
-      }
+      for (const p of (c.photos || [])) photos.push(await store.exportPhoto(p));
       payload.cabinets.push({ ...c, photos });
     }
     const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
@@ -373,48 +590,28 @@
     const file = e.target.files[0];
     e.target.value = '';
     if (!file) return;
-    if (!confirm('การกู้คืนจะแทนที่ข้อมูลปัจจุบันทั้งหมด ต้องการดำเนินการต่อหรือไม่?')) return;
+    if (!confirm('การกู้คืนจะแทนที่ข้อมูลปัจจุบันทั้งหมด' + (cloudMode ? ' (ทุกคนที่ใช้ลิงก์นี้จะเห็นการเปลี่ยนแปลง)' : '') + ' ต้องการดำเนินการต่อหรือไม่?')) return;
     try {
-      const text = await file.text();
-      const payload = JSON.parse(text);
+      const payload = JSON.parse(await file.text());
       if (!Array.isArray(payload.cabinets)) throw new Error('invalid');
-
-      // ลบของเดิมทั้งหมด
-      for (const c of cabinets) await deleteCabinet(c.id);
-      cabinets = [];
-
-      await loadPayload(payload);
+      showToast('กำลังกู้คืนข้อมูล...');
+      await store.clear();
+      const added = await store.bulkPut(payload.cabinets);
+      if (!cloudMode) cabinets = added; // โหมดคลาวด์ snapshot จะอัปเดตให้เอง
       renderList();
       showToast('กู้คืนข้อมูลสำเร็จ');
     } catch (err) {
       console.error(err);
-      showToast('ไฟล์ backup ไม่ถูกต้อง');
+      showToast('กู้คืนไม่สำเร็จ: ไฟล์ไม่ถูกต้องหรือเชื่อมต่อไม่ได้');
     }
   });
 
-  // ใส่ทั้งชุดใน transaction เดียว: เร็วกว่าทีละรายการมาก และถ้าพังกลางทางจะไม่ได้ข้อมูลครึ่งเดียว
-  function loadPayload(payload) {
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, 'readwrite');
-      const store = tx.objectStore(STORE);
-      const added = [];
-      for (const raw of payload.cabinets) {
-        const photos = (raw.photos || []).map((d) => (typeof d === 'string' ? dataURLToBlob(d) : d));
-        const cab = { ...raw, photos };
-        store.put(cab);
-        added.push(cab);
-      }
-      tx.oncomplete = () => { cabinets.push(...added); resolve(); };
-      tx.onerror = () => reject(tx.error);
-    });
-  }
-
-  // ไฟล์เริ่มต้นในโฟลเดอร์: เครื่องใหม่ (ว่าง) → โหลดทั้งชุด
-  // เครื่องที่เคยโหลดชุดเก่าไปแล้ว → เติมเฉพาะเลขกุญแจที่ยังว่าง ไม่ทับที่ผู้ใช้กรอกเอง
+  // ไฟล์เริ่มต้นในโฟลเดอร์: ฐานข้อมูลว่าง → โหลดทั้งชุด
+  // เคยโหลดชุดเก่าไปแล้ว → เติมเฉพาะเลขกุญแจที่ยังว่างตาม id ไม่ทับที่ผู้ใช้กรอกเอง
   async function seedFromStarterFile() {
     let payload;
     try {
-      const resp = await fetch(encodeURIComponent('นำเข้าข้อมูลตู้ไข่-เริ่มต้น.json'));
+      const resp = await fetch(encodeURIComponent(SEED_FILE));
       if (!resp.ok) return;
       payload = await resp.json();
     } catch (_) {
@@ -422,29 +619,64 @@
     }
     if (!payload || !Array.isArray(payload.cabinets)) return;
 
-    if (cabinets.length === 0) {
-      await loadPayload(payload);
-      showToast(`โหลดข้อมูลเริ่มต้น ${cabinets.length} ตู้แล้ว`);
-      return;
-    }
-
-    const byId = new Map(payload.cabinets.map((c) => [c.id, c]));
-    let filled = 0;
-    for (const c of cabinets) {
-      const src = byId.get(c.id);
-      if (src && src.keyNumber && !c.keyNumber) {
-        c.keyNumber = src.keyNumber;
-        await putCabinet(c);
-        filled++;
+    try {
+      if (cabinets.length === 0) {
+        const added = await store.bulkPut(payload.cabinets);
+        if (!cloudMode) cabinets = added;
+        showToast(`โหลดข้อมูลเริ่มต้น ${added.length} ตู้แล้ว`);
+        return;
       }
+      const byId = new Map(payload.cabinets.map((c) => [c.id, c]));
+      let filled = 0;
+      for (const c of cabinets) {
+        const src = byId.get(c.id);
+        if (src && src.keyNumber && !c.keyNumber) {
+          const saved = await store.save({ ...c, keyNumber: src.keyNumber }, { kept: c.photos || [], newFiles: [], oldPhotos: c.photos || [] });
+          Object.assign(c, saved);
+          filled++;
+        }
+      }
+      if (filled) showToast(`เติมเลขกุญแจให้ ${filled} ตู้แล้ว`);
+    } catch (err) {
+      console.error(err);
     }
-    if (filled) showToast(`เติมเลขกุญแจให้ ${filled} ตู้แล้ว`);
+  }
+
+  function setModeChip() {
+    const chip = $('#modeChip');
+    if (!chip) return;
+    chip.textContent = store.label;
+    chip.hidden = false;
   }
 
   // ---------- init ----------
   (async function init() {
-    db = await openDB();
-    cabinets = await getAll();
+    const cfg = window.TUKAI_FIREBASE;
+    if (cfg && cfg.projectId) {
+      try {
+        await CloudStore.init(cfg);
+        store = CloudStore;
+        cloudMode = true;
+      } catch (err) {
+        console.error(err);
+        showToast('เชื่อมต่อฐานข้อมูลกลางไม่ได้ ใช้ข้อมูลในเครื่องแทน');
+      }
+    }
+    if (!store) {
+      store = LocalStore;
+      await LocalStore.init();
+      cabinets = await LocalStore.all();
+    }
+    setModeChip();
+
+    if (cloudMode) {
+      $('#resultCount').textContent = 'กำลังโหลดข้อมูลจากฐานข้อมูลกลาง...';
+      await CloudStore.subscribe(() => {
+        renderList();
+        if (detailId && !$('#viewDetail').classList.contains('hidden')) openDetail(detailId);
+      });
+    }
+
     await seedFromStarterFile();
     renderList();
   })();

@@ -9,6 +9,7 @@
 .top{background:linear-gradient(90deg,rgb(var(--sky)),rgb(var(--sky2)));border-bottom:none;color:#fff}
 .top b{color:#fff}
 .top .icon-btn{background:rgb(255 255 255/.28);border-color:rgb(255 255 255/.6);color:#fff;font-size:22px;font-weight:700;line-height:1}
+.top .chip{background:rgb(255 255 255/.18);border-color:rgb(255 255 255/.45);color:#fff;font-size:11.5px;padding:3px 9px;margin-left:2px;white-space:nowrap}
 .back{color:rgb(var(--sky))}
 .mini{border-color:rgb(var(--sky)/.4);color:rgb(var(--sky));font-weight:600}
 input:focus,textarea:focus{border-color:rgb(var(--sky));box-shadow:0 0 0 3px rgb(var(--sky)/.18)}
