@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>เช็คตู้ไข่</title>
+<link rel="stylesheet" href="assets/skin.css">
+<link rel="stylesheet" href="assets/app.css?v=6">
+</head>
+<body>
+
+<div class="top">
+  <img class="logo" src="assets/logo.jpg?v=4" alt="เจมตะลุยโลก">
+  <b class="disp">เช็คตู้ไข่</b>
+  <div class="sp"></div>
+  <button class="icon-btn" id="btnBackup" title="สำรอง/กู้คืนข้อมูล">⋮</button>
+</div>
+
+<main class="wrap">
+
+  <!-- หน้าแรก: ค้นหา + ปุ่มหลัก + ผลลัพธ์ -->
+  <section id="viewList" class="view">
+    <div class="searchbar">
+      <input id="searchInput" type="text" placeholder="พิมพ์ชื่อร้าน / สถานที่ เพื่อค้นหา...">
+      <button type="button" class="clear-btn hidden" id="btnClearSearch" title="ล้างคำค้นหา">✕</button>
+    </div>
+
+    <div id="homeActions" class="home-actions">
+      <button type="button" class="big-btn primary" id="btnAddHome">+ เพิ่มตู้ไข่ใหม่</button>
+      <button type="button" class="big-btn" id="btnShowAll">ดูข้อมูลทั้งหมด (<span id="totalCount">0</span> ตู้)</button>
+    </div>
+
+    <div id="allHeader" class="all-header hidden">
+      <button type="button" class="back" id="btnBackFromAll">‹ กลับหน้าแรก</button>
+      <button type="button" class="mini" id="btnAddAll">+ เพิ่มตู้</button>
+    </div>
+
+    <div id="resultCount" class="muted small" style="padding:4px 2px 10px"></div>
+    <div id="list" class="list"></div>
+    <div id="emptyState" class="empty hidden" style="padding:40px 10px"></div>
+  </section>
+
+  <!-- หน้ารายละเอียดตู้ -->
+  <section id="viewDetail" class="view hidden">
+    <button type="button" class="back" id="btnBackFromDetail">‹ กลับ</button>
+    <div id="detailBody"></div>
+  </section>
+
+  <!-- หน้าเพิ่ม/แก้ไขตู้ -->
+  <section id="viewForm" class="view hidden">
+    <button type="button" class="back" id="btnBackFromForm">‹ กลับ</button>
+    <h2 class="disp" id="formTitle" style="margin:6px 0 14px">เพิ่มตู้ไข่ใหม่</h2>
+    <form id="cabinetForm">
+      <label>สถานที่ / ชื่อร้าน</label>
+      <input id="fLocation" type="text" placeholder="เช่น ส้มตำป้าตุ๊, ร้านพี่เอ็น">
+
+      <label>เลขกุญแจ</label>
+      <input id="fKey" type="text" placeholder="เช่น 12, A7">
+
+      <label>รูปตู้</label>
+      <label for="fPhotos" class="photo-btn">📷 ถ่ายรูป / เลือกรูปจากเครื่อง</label>
+      <input id="fPhotos" type="file" accept="image/*" multiple class="hidden">
+      <div id="photoPreview" class="photo-grid"></div>
+
+      <label>ลักษณะตู้ / ชื่อตู้</label>
+      <input id="fName" type="text" placeholder="เช่น ตู้ 2 ชั้น, ตู้หัวกลมเหลือง">
+
+      <label>บันทึกเพิ่มเติม</label>
+      <textarea id="fNote" rows="2" placeholder="รายละเอียดอื่น ๆ (ถ้ามี)"></textarea>
+
+      <button type="submit" class="btn-primary">บันทึก</button>
+    </form>
+  </section>
+
+</main>
+
+<input type="file" id="importFile" accept="application/json" class="hidden">
+<div class="toast" id="toast"></div>
+
+<script src="assets/app.js?v=3"></script>
+</body>
+</html>
